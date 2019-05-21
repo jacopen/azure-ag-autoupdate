@@ -1,0 +1,150 @@
+resource_types:
+- name: azure-blobstore
+  type: docker-image
+  source:
+    repository: pcfabr/azure-blobstore-resource
+- name: slack-notification
+  type: docker-image
+  source:
+    repository: cfcommunity/slack-notification-resource
+    tag: latest
+
+resources:
+- name: key
+  type: azure-blobstore
+  source:
+    storage_account_name: ((storage_account_name))
+    storage_account_key: ((storage_account_key))
+    container: ((container))
+    versioned_file: server.key
+- name: cert
+  type: azure-blobstore
+  source:
+    storage_account_name: ((storage_account_name))
+    storage_account_key: ((storage_account_key))
+    container: ((container))
+    versioned_file: server.crt
+- name: pfx
+  type: azure-blobstore
+  source:
+    storage_account_name: ((storage_account_name))
+    storage_account_key: ((storage_account_key))
+    container: ((container))
+    versioned_file: server.pfx
+- name: slack-alert
+  type: slack-notification
+  source:
+    url: ((slack-webhook)) 
+
+jobs:
+- name: generate-certificate
+  plan:
+  - task: run-rego
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: jacopen/lego
+      params:
+        AZURE_CLIENT_ID: ((azure_client_id))
+        AZURE_CLIENT_SECRET: ((azure_client_secret))
+        AZURE_RESOURCE_GROUP: ((azure_resource_group))
+        AZURE_SUBSCRIPTION_ID: ((azure_subscription_id))
+        AZURE_TENANT_ID: ((azure_tenant_id))
+        APP_DOMAIN: ((app_domain))
+        SYS_DOMAIN: ((sys_domain))
+        DOMAIN: ((domain))
+        EMAIL: ((email))
+      outputs:
+        - name: certs
+      run:
+        path: sh
+        args:
+        - -c
+        - |
+          set -ex
+          cd certs
+          lego --email=$EMAIL --domains=$APP_DOMAIN --domains=$SYS_DOMAIN --dns="azure" --key-type=rsa4096 --dns.resolvers=8.8.8.8 -a run 
+          cp .lego/certificates/$DOMAIN.key .lego/certificates/$DOMAIN.crt .
+          find .
+  - put: key
+    params:
+      file: certs/*.key 
+  - put: cert
+    params:
+      file: certs/*.crt
+- name: convert-to-pfx
+  plan:
+  - get: key
+    passed: [generate-certificate]
+    trigger: true
+  - get: cert
+    passed: [generate-certificate]
+  - task: convert
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: jacopen/openssl
+      params:
+        PFX_PASSWORD: ((pfx_password))
+      inputs:
+        - name: key
+        - name: cert
+      outputs:
+        - name: out
+      run:
+        path: sh
+        args:
+        - -c
+        - |
+          set -ex
+          openssl pkcs12 -export -inkey key/server.key -in cert/server.crt -out out/server.pfx -password pass:$PFX_PASSWORD
+          find .
+  - put: pfx
+    params:
+      file: out/server.pfx
+- name: apply-to-application-gateway
+  plan:
+  - get: pfx
+    passed: [convert-to-pfx]
+    trigger: true
+  - task: generate-pfx
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: microsoft/azure-cli
+      params:
+        AZURE_CLIENT_ID: ((azure_client_id))
+        AZURE_CLIENT_SECRET: ((azure_client_secret))
+        AZURE_TENANT_ID: ((azure_tenant_id))
+        AZURE_RESOURCE_GROUP: ((azure_resource_group))
+        AZURE_APPLICATION_GATEWAY: ((azure_application_gateway))
+        AZURE_CERT_NAME: ((azure_cert_name))
+        PFX_PASSWORD: ((pfx_password))
+      inputs:
+        - name: pfx
+      run:
+        path: sh
+        args:
+        - -c
+        - |
+          set -ex
+          az login --service-principal --username $AZURE_CLIENT_ID --password $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+          az network application-gateway ssl-cert update --resource-group $AZURE_RESOURCE_GROUP --gateway-name=$AZURE_APPLICATION_GATEWAY --name $AZURE_CERT_NAME --cert-password $PFX_PASSWORD --cert-file pfx/server.pfx
+    on_success:
+      put: slack-alert
+      params:
+        channel: ((slack-channel))
+        text: |
+          Application Gateway update succeeded
+    on_failure:
+      put: slack-alert
+      params:
+        channel: ((slack-channel))
+        text: |
+          Application Gateway update failed

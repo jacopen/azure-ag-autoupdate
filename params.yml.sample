@@ -1,0 +1,17 @@
+storage_account_name: 
+storage_account_key: 
+container:
+azure_client_id:
+azure_client_secret:
+azure_resource_group:
+azure_subscription_id:
+azure_tenant_id:
+azure_application_gateway:
+azure_cert_name:
+domain: "_.apps.example.com"
+app_domain: "*.apps.example.com"
+sys_domain: "*.sys.example.com"
+email: hogehoge@example.com
+pfx_password: 12345
+slack-webhook: foobar
+slack-channel: '#development'
